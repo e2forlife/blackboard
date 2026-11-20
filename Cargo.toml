@@ -1,0 +1,21 @@
+[package]
+name = "blackboard"
+version = "0.1.0"
+edition = "2024"
+description = "A no_std retained parameter bus for embedded tasks with typed access and change notifications"
+readme = "readme.md"
+keywords = ["embedded", "no-std", "embassy", "blackboard"]
+categories = ["embedded", "no-std"]
+include = ["/Cargo.toml", "/readme.md", "/src/**", "/tests/**", "/LICENSE*"]
+
+[package.metadata.docs.rs]
+features = ["build-tools"]
+
+[features]
+build-tools = []
+
+[dependencies]
+embassy-sync = "0.8.0"
+
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
