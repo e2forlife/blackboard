@@ -132,6 +132,9 @@ pub struct ParamMeta {
 pub trait ParamCatalog: Copy + Sized + 'static {
     const COUNT: usize;
     const BUF_SIZE: usize;
+    /// Packed, little-endian startup values, generated from the parameter CSV.
+    /// An empty slice keeps manual catalogs zero-initialized.
+    const DEFAULT_BYTES: &'static [u8] = &[];
     fn index(self) -> usize;
     fn from_index(idx: usize) -> Option<Self>;
     fn meta(self) -> &'static ParamMeta;
@@ -139,8 +142,16 @@ pub trait ParamCatalog: Copy + Sized + 'static {
     fn from_ext_id(ext_id: u32) -> Option<Self>;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupState {
+    Restoring,
+    Finishing,
+    Complete,
+}
+
 struct InnerState<const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS: usize> {
     buffer: [u8; BUF_SIZE],
+    startup: StartupState,
     sub_dirty: [[u32; WORDS]; MAX_SUBS],
     nvm_dirty: [u32; WORDS],
 }
@@ -161,10 +172,32 @@ pub struct Blackboard<
 impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS: usize>
     Blackboard<K, BUF_SIZE, WORDS, MAX_SUBS>
 {
+    /// Load catalog defaults without notifying subscribers or dirtying NVM.
+    ///
+    /// Restore saved values with [`PublisherId::NvmRestore`], then call
+    /// [`Self::finish_startup`] before starting normal producers. All writes
+    /// remain silent until startup finishes, including ordinary publishes.
     pub const fn new() -> Self {
+        assert!(BUF_SIZE == K::BUF_SIZE, "buffer size must match catalog");
+        assert!(
+            WORDS == K::COUNT.div_ceil(32),
+            "word count must match catalog"
+        );
+        assert!(MAX_SUBS <= 16, "at most 16 subscribers are supported");
+        assert!(
+            K::DEFAULT_BYTES.is_empty() || K::DEFAULT_BYTES.len() == BUF_SIZE,
+            "default bytes must fill the catalog buffer"
+        );
+        let mut buffer = [0u8; BUF_SIZE];
+        let mut i = 0;
+        while i < K::DEFAULT_BYTES.len() {
+            buffer[i] = K::DEFAULT_BYTES[i];
+            i += 1;
+        }
         Self {
             inner: Mutex::new(core::cell::RefCell::new(InnerState {
-                buffer: [0u8; BUF_SIZE],
+                buffer,
+                startup: StartupState::Restoring,
                 sub_dirty: [[0u32; WORDS]; MAX_SUBS],
                 nvm_dirty: [0u32; WORDS],
             })),
@@ -174,10 +207,51 @@ impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS:
         }
     }
 
+    /// Publish the final startup state after all NVM restores have completed.
+    ///
+    /// Every parameter is queued once for each assigned subscriber, including
+    /// zero or unchanged values. This does not mark persistent parameters dirty.
+    /// Repeated calls do nothing. Call from the startup task before enabling
+    /// normal producers; readers may inspect defaults before this call.
+    pub fn finish_startup(&self) {
+        let finishing = self.inner.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            if state.startup != StartupState::Restoring {
+                return false;
+            }
+            state.startup = StartupState::Finishing;
+            true
+        });
+        if !finishing {
+            return;
+        }
+        let mut wake_mask = 0;
+        for (idx, meta) in K::all_meta().iter().enumerate() {
+            wake_mask |= meta.sub_mask;
+            // Keep each critical section bounded to one parameter's routing.
+            self.inner.lock(|cell| {
+                let mut state = cell.borrow_mut();
+                let mut mask = meta.sub_mask;
+                while mask != 0 {
+                    let sub_id = mask.trailing_zeros() as usize;
+                    if sub_id < MAX_SUBS {
+                        state.sub_dirty[sub_id][idx / 32] |= 1u32 << (idx % 32);
+                    }
+                    mask &= mask - 1;
+                }
+            });
+        }
+        self.inner.lock(|cell| {
+            cell.borrow_mut().startup = StartupState::Complete;
+        });
+        self.signal_subscribers(wake_mask);
+    }
+
     /// Publish raw bytes, zero-filling the remainder of the slot.
     ///
     /// Returns true for accepted writes, including unchanged values. Only
-    /// changes wake subscribers. Raw writes accept any encoding that fits.
+    /// changes wake subscribers after startup. Raw writes accept any encoding
+    /// that fits. During startup, writes neither notify nor mark NVM dirty.
     pub fn publish_raw(&self, key: K, bytes: &[u8], source: PublisherId) -> bool {
         let m = key.meta();
         if bytes.len() > m.max_len {
@@ -195,6 +269,10 @@ impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS:
 
             slot.fill(0);
             slot[..bytes.len()].copy_from_slice(bytes);
+
+            if state.startup != StartupState::Complete {
+                return (0u16, false);
+            }
 
             let idx = key.index();
             let word = idx / 32;
@@ -217,7 +295,14 @@ impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS:
         });
 
         // Signal tasks outside the critical section
-        let mut mask = wake_mask;
+        self.signal_subscribers(wake_mask);
+        if wake_nvm {
+            self.nvm_signal.signal(());
+        }
+        true
+    }
+
+    fn signal_subscribers(&self, mut mask: u16) {
         while mask != 0 {
             let sub_id = mask.trailing_zeros() as usize;
             if sub_id < MAX_SUBS {
@@ -225,10 +310,6 @@ impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS:
             }
             mask &= mask - 1;
         }
-        if wake_nvm {
-            self.nvm_signal.signal(());
-        }
-        true
     }
 
     /// Publish a typed value using the same change notifications as raw writes.
@@ -288,6 +369,10 @@ impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS:
     fn pop_dirty(&self, sub_id: usize) -> Option<K> {
         self.inner.lock(|cell| {
             let mut state = cell.borrow_mut();
+            // Finish queuing the full catalog before exposing startup changes.
+            if state.startup != StartupState::Complete {
+                return None;
+            }
             for (w_idx, word) in state.sub_dirty[sub_id].iter_mut().enumerate() {
                 if *word != 0 {
                     let bit = word.trailing_zeros() as usize;
@@ -305,5 +390,71 @@ impl<K: ParamCatalog, const BUF_SIZE: usize, const WORDS: usize, const MAX_SUBS:
 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    #[derive(Clone, Copy)]
+    struct Persistent;
+
+    impl ParamCatalog for Persistent {
+        const COUNT: usize = 1;
+        const BUF_SIZE: usize = 4;
+        const DEFAULT_BYTES: &'static [u8] = &1500u32.to_le_bytes();
+        fn index(self) -> usize {
+            0
+        }
+        fn from_index(idx: usize) -> Option<Self> {
+            (idx == 0).then_some(Self)
+        }
+        fn meta(self) -> &'static ParamMeta {
+            &Self::all_meta()[0]
+        }
+        fn all_meta() -> &'static [ParamMeta] {
+            &[ParamMeta {
+                ext_id: 1,
+                offset: 0,
+                max_len: 4,
+                dtype: DataType::U32,
+                persistent: true,
+                sub_mask: 1,
+            }]
+        }
+        fn from_ext_id(ext_id: u32) -> Option<Self> {
+            (ext_id == 1).then_some(Self)
+        }
+    }
+
+    #[test]
+    fn defaults_and_startup_restores_never_dirty_or_signal_nvm() {
+        let board = Blackboard::<Persistent, 4, 1, 1>::new();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut nvm = core::pin::pin!(board.nvm_signal.wait());
+        assert_eq!(board.read::<u32>(Persistent), Some(1500));
+        assert_eq!(nvm.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(board.publish(Persistent, 2000u32, PublisherId::NvmRestore));
+        assert!(board.publish(Persistent, 3000u32, PublisherId::Internal));
+        board.finish_startup();
+        assert_eq!(nvm.as_mut().poll(&mut cx), Poll::Pending);
+        board
+            .inner
+            .lock(|cell| assert_eq!(cell.borrow().nvm_dirty, [0]));
+
+        // NVM restores remain exempt from write-back after startup as well.
+        assert!(board.publish(Persistent, 4000u32, PublisherId::NvmRestore));
+        board
+            .inner
+            .lock(|cell| assert_eq!(cell.borrow().nvm_dirty, [0]));
+        assert_eq!(nvm.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(board.publish(Persistent, 5000u32, PublisherId::Internal));
+        board
+            .inner
+            .lock(|cell| assert_eq!(cell.borrow().nvm_dirty, [1]));
+        assert_eq!(nvm.as_mut().poll(&mut cx), Poll::Ready(()));
     }
 }
